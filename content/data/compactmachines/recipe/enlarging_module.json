@@ -1,0 +1,12 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "key": {
+    "B": { "item": "minecraft:stone_button" },
+    "E": { "item": "minecraft:ender_eye" },
+    "L": { "item": "minecraft:light_weighted_pressure_plate" },
+    "P": { "item": "minecraft:piston" }
+  },
+  "pattern": ["BPB", "BEB", "BLB"],
+  "result": { "count": 1, "id": "compactmachines:enlarging_module" }
+}

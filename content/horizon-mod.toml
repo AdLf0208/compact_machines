@@ -1,0 +1,14 @@
+# Port-owned content mod for the Compact Machines slice 1: the machine block,
+# its walls, the Personal Shrinking Device and the two modules. Block/item
+# facts, sizes, recipes and the lang lines are carried from
+# compactmachines-neoforge-7.0.81.jar (CompactMods/CompactMachines, MIT); the
+# Rust is a clean-room rewrite. Local-only until publishing is approved
+# (ARCHITECTURE.md §8).
+id = "compactmachines"
+name = "Compact Machines"
+version = "0.1.0"
+description = "A machine that owns a compact room you can enter and leave"
+authors = ["Davenonymous", "RobotGryphon"]
+api = "0.2"
+side = "both"
+capabilities = ["registries"]
