@@ -1,41 +1,19 @@
-# Compact Machines for Horizon
+# Compact Machines — a Horizon port
 
-A native Horizon port of **Compact Machines 7.0.81**
-(`CompactMods/CompactMachines`, MIT) for Minecraft 26.3: a machine block that
-owns a compact room you can enter and leave with the Personal Shrinking Device.
+**Compact Machines** is a Minecraft mod. Minecraft Mod. Adds one simple game mechanic: Small rooms inside of blocks. This repository is a **port of it to [Horizon](https://github.com/horizon-rust/horizon)**, the Rust engine for Minecraft Java 26.3. It carries the complete source of the port plus the content files it ships, and installs as a single `.hmod` package.
 
-Slice 1 is the **machine and one room, at the jar's own sizes**: place a
-`new_machine` (a 7³ `normal` room by default, or any template through
-`/compactmachines give new <template>`), use the PSD on it, and you arrive
-inside a sealed room whose interior is exactly the template's size — 7×7×7
-inside a 9×9×9 shell for `normal`, 3×3×3 inside 5³ for `tiny`. Use the PSD inside
-and you are back at the machine. Rooms have a code (`XXXX-XXXX-XXXX` from the
-jar's own alphabet), an owner and a site on the jar's 1024-block grid, and they
-persist in `<world>/compactmachines/rooms.dat`, so a room and its machine
-survive a relaunch.
+Upstream: [CompactMods/CompactMachines](https://github.com/CompactMods/CompactMachines) — licence **MIT**.
 
-## One package, code and content
+| | |
+|---|---|
+| Upstream mod | Compact Machines ([source](https://github.com/CompactMods/CompactMachines)) |
+| Ported to | Horizon 0b14f8a, Minecraft Java 26.3, mod API `0.2` |
+| Package | `compactmachines.hmod` (install it with the Horizon launcher) |
+| Licence | **MIT** — the upstream mod's licence; see [Licence and credit](#licence-and-credit) |
 
-The 2026-11-17 mod-API merge retired the `.hnmod` container, so this is **one
-flat `.hmod`** (`api = "0.2"`):
+## What this port implements
 
-```text
-compactmachines.hmod
-  horizon-mod.toml   the only manifest: id, version, api, side, [native] pins
-  Cargo.toml         one crate; its only dependency is the fetched SDK
-  src/lib.rs         the one `#[mod_api::horizon_mod] impl Hooks`
-  src/runtime.rs     the pure room rules (34 unit tests, no game type)
-  src/support.rs     the glue: block entity, items, clicks, teleports, commands
-  assets/, data/     the carried content: 4 blocks, 3 items, recipes, loot, tags
-```
-
-The room rules (templates, codes, the region spiral, the shell geometry, the
-registry file) live in `src/runtime.rs` and are unchanged from the 0.1.0
-`.hnmod` port; `src/support.rs` is the same glue, rewritten against the SDK's
-typed hooks and Parts. `notes.md` carries the hook table and the migration's
-own traps.
-
-## The slice, and what it does not do
+### The slice, and what it does not do
 
 In: the four blocks (`machine`, `new_machine`, `wall`, `solid_wall`), the three
 items (`personal_shrinking_device`, `shrinking_module`, `enlarging_module`),
@@ -51,24 +29,40 @@ screens; the PSD's keybinds and its cooldown UI (the cooldown is server-side);
 Jade/JEI/Curios; the villager; the gamerules; out-of-bounds damage and the
 teleport veto; machine dyeing's coloured renderer.
 
-## Commands
+## Not yet ported
 
-| Command | What it does |
-|---|---|
-| `/compactmachines rooms` | the registered rooms and their count |
-| `/compactmachines info` | the room you stand in: its size, its code |
-| `/compactmachines give new <template>` | a `new_machine` carrying that template (op 2) |
-| `/compactmachines give existing <code>` | a bound `machine` for that room (op 2) |
-| `/compactmachines teleport <code>` | enter that room (op 2) |
+No omissions are recorded for this slice; `notes.md` is the authoritative list.
 
-## Building it
+## Installing
 
-The package is built by the launcher against the pinned game build
-(`horizon-launcher native-build .`); `cargo horizon-mod build` packs it
-(`cargo horizon-mod check compactmachines.hmod` is the registry's own check).
-`src/runtime.rs` and its tests build and run with `cargo test` alone, which is
-the port's unit gate.
+1. Install the [Horizon launcher](https://github.com/horizon-rust/horizon/releases) (0.2.70 or newer).
+2. Add `compactmachines.hmod` to the instance's mods.
+3. The package is pinned to a specific Horizon build; the launcher checks that pin.
 
-Licence: MIT, read from the jar; see [LICENSE](LICENSE) and
-[LICENSE-NOTICE.md](LICENSE-NOTICE.md). Local-only until the maintainer approves
-publishing.
+## Licence and credit
+
+Compact Machines was created by its upstream authors; the code, models and assets in the original mod
+remain theirs and are used here under **MIT**. The Rust in this repository is a clean-room
+rewrite for Horizon, not a translation of the original source.
+
+- `LICENSE` — the upstream licence text.
+- `LICENSE-NOTICE.md` — what this port carries and where it came from.
+- The upstream project: https://github.com/CompactMods/CompactMachines
+
+## Technical details
+
+```
+horizon-mod.toml   package manifest (id, version, api, [native] pin)
+Cargo.toml         the crate; depends on `horizon-mod-api` from the fetched SDK
+src/               lib.rs (the one `impl Hooks`), runtime.rs (pure logic + tests), glue
+assets/ data/      the content the package ships
+tools/             content generators and the e2e scenario
+```
+
+- Build: `cargo horizon-mod build` (packages; it does not compile against the game).
+- Test: `cargo test`, `cargo clippy --all-targets -- -D warnings`.
+- In-game: `ports/tools/launcher-game.sh run compactmachines` in the campaign tree, or install the
+  `.hmod` and play; the harness scenario is `tools/e2e.sh`.
+
+This repository is generated from the campaign's port at `ports/compactmachines/`; the port's own
+`notes.md` is the full record (decisions, traps, evidence).
