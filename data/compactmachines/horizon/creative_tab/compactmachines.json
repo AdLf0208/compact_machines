@@ -1,0 +1,13 @@
+{
+  "title": "Compact Machines",
+  "icon": "compactmachines:new_machine",
+  "items": [
+    "compactmachines:new_machine",
+    "compactmachines:machine",
+    "compactmachines:wall",
+    "compactmachines:solid_wall",
+    "compactmachines:personal_shrinking_device",
+    "compactmachines:shrinking_module",
+    "compactmachines:enlarging_module"
+  ]
+}

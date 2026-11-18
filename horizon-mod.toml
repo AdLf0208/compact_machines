@@ -1,0 +1,37 @@
+# Compact Machines for Horizon — slice 1, one flat SDK package.
+#
+# Migrated 2026-11-18 from the retired `.hnmod` container (Horizon's mod-API merge
+# #16941, launcher ≥ 0.2.70; PR #17992 cleans up the old files). The registry
+# closed the port's former submission #836 with the format purge, so 0.2.0
+# supersedes it. This manifest is the only one: identity, the content capability
+# and the exact native pins. `assets/` and `data/` are the carried content (the
+# machine, the two walls, the Personal Shrinking Device, the two modules and the
+# recipes), `src/` is the port's code; both halves travel in one file.
+#
+# Licence: MIT, read from the jar's `META-INF/neoforge.mods.toml` (rank 0,
+# permissive). `LICENSE` and `LICENSE-NOTICE.md` travel inside the package, and
+# the same two texts ride in the content half as `data/compactmachines/license/`.
+# Local-only until the maintainer approves publishing (ARCHITECTURE.md §8).
+id = "compactmachines"
+name = "Compact Machines"
+version = "0.2.0"
+description = """A port of Compact Machines for Horizon: a machine block that owns a compact room you
+can enter and leave with the Personal Shrinking Device. A placed machine takes its room template
+(the jar's eight sizes, 3x3x3 up to 45x45x45) or the room code it was broken from; the device
+creates the room, moves you to its spawn inside a one-block shell, and brings you back to the
+machine. Rooms have a 12-character code, an owner and a site on the jar's 1024-block grid, and are
+persisted in `<world>/compactmachines/rooms.dat`. The compact dimension itself, the preview and
+upgrade screens, the keybinds, the PSD's own cooldown UI and the integrations are not ported."""
+authors = ["Davenonymous", "RobotGryphon", "AdLf0208"]
+# The content API: exact and checked. This package ships carried content beside its code, so the
+# capability is a real claim; it is also the one value the manifest schema has.
+api = "0.2"
+# The installation side, not the hook's: an integrated server belongs to the client
+# installation, so a single-player world or a LAN host needs both.
+side = "both"
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

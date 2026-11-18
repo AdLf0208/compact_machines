@@ -1,0 +1,8 @@
+{
+  "values": [
+    "compactmachines:wall",
+    "compactmachines:machine",
+    "compactmachines:new_machine",
+    "compactmachines:solid_wall"
+  ]
+}
