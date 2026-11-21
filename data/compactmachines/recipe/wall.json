@@ -2,7 +2,7 @@
   "type": "minecraft:crafting_shaped",
   "category": "building",
   "key": {
-    "D": { "item": "minecraft:polished_deepslate" }
+    "D": "minecraft:polished_deepslate"
   },
   "pattern": ["DDD", "D D", "DDD"],
   "result": { "count": 8, "id": "compactmachines:wall" }

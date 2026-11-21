@@ -28,8 +28,8 @@ use mod_api::{
     CommandArgumentValue, CommandSource, Component, Flow, Host, HostSide, Identifier,
     InteractionResult, ItemKey, ItemPart, ItemStack, LevelRef, LootDropsEvent,
     OnBlockPlacedByEvent, PlayerRef, Registrar, RightClickBlockEvent, RunModCommandEvent,
-    ServerHost, ServerTickEvent, ServerTickPhase, Tag, Text, UseItemEvent, UseItemOnEvent,
-    WorldLifecycleEvent, WorldPhase,
+    ServerHost, ServerTickEvent, ServerTickPhase, Tag, Text, TicketController, TicketOwner,
+    UseItemEvent, UseItemOnEvent, ValidateTicketsEvent, WorldLifecycleEvent, WorldPhase,
 };
 
 use crate::runtime::{
@@ -52,26 +52,35 @@ const STORE_DIR: &str = "compactmachines";
 const STORE_FILE: &str = "rooms.dat";
 /// Write at most once a second; a crash loses at most that much.
 const SAVE_INTERVAL_TICKS: u64 = 20;
-/// A shell that cannot be placed (chunks never loaded) is retried this long.
-const BUILD_RETRY_TICKS: u32 = 600;
-/// How many sites a room tries before it gives up on finding an empty one.
-const SITE_TRIES: u32 = 64;
+/// A room that is not ready this long (its chunks never load, or every site it tries is taken)
+/// stops holding its player: the player is told and stays where they are, never moved into an
+/// unbuilt room.
+const ENTRY_WAIT_TICKS: u32 = 200;
+/// How many players may wait for a room at once. A click from a player already waiting
+/// replaces their own entry, so one player cannot grow the queue.
+const MAX_PENDING_ENTRIES: usize = 8;
 /// The PSD's cooldown after a shift, in ticks (`RoomHelper` puts a 25-tick cooldown on the device
 /// at every entry and every exit).
 const PSD_COOLDOWN_TICKS: u64 = 25;
-/// The 0.1.0 command usages, byte for byte: the e2e's scenarios and the published README name
-/// them, so a rename here is a user-visible break.
+/// The 0.1.0 command wordings, unchanged: the e2e's scenarios and the published README name
+/// them, so a rename here is a user-visible break. The *argument kinds* had to change: a
+/// `word` is `[0-9A-Za-z_]`, so it can carry neither the `:` of `compactmachines:normal` nor the
+/// `-` of a room code (`XXXX-XXXX-XXXX`), and the dispatcher refused every documented line with
+/// "Expected whitespace to end one argument" (found by this port's first in-game run). The last
+/// argument is a greedy text, which carries both.
 const USAGE_ROOMS: &str = "compactmachines rooms";
 const USAGE_INFO: &str = "compactmachines info";
-const USAGE_GIVE_NEW: &str = "compactmachines give new <template:word>";
-const USAGE_GIVE_EXISTING: &str = "compactmachines give existing <code:word>";
-const USAGE_TELEPORT: &str = "compactmachines teleport <code:word>";
+const USAGE_GIVE_NEW: &str = "compactmachines give new <template:text>";
+const USAGE_GIVE_EXISTING: &str = "compactmachines give existing <code:text>";
+const USAGE_TELEPORT: &str = "compactmachines teleport <code:text>";
 
 /// Registration keys, so a hot path compares block identity instead of allocating a name.
 static MACHINE_KEY: OnceLock<BlockKey> = OnceLock::new();
 static NEW_MACHINE_KEY: OnceLock<BlockKey> = OnceLock::new();
 static SOLID_WALL_KEY: OnceLock<BlockKey> = OnceLock::new();
 static PSD_KEY: OnceLock<ItemKey> = OnceLock::new();
+/// This package's own chunk-ticket controller (registered once, in `register`).
+static TICKETS: OnceLock<TicketController> = OnceLock::new();
 
 /// `Block.UPDATE_ALL` (`UPDATE_NEIGHBORS | UPDATE_CLIENTS`), what a placed block uses.
 fn shell_flags() -> BlockUpdateFlags {
@@ -151,14 +160,67 @@ struct Teleport {
     player: u128,
     dim: String,
     pos: [i32; 3],
-    /// A room whose shell to place once the player has arrived.
-    build: Option<String>,
 }
 
-/// A room whose shell still has to be placed.
-struct PendingBuild {
+/// A room entry waiting for its destination to be ready. The player is **not** moved until the
+/// room is validated and built: a later pass can then never move the room out from under them.
+struct PendingEntry {
+    player: u128,
     code: String,
+    /// Where the player came from: their own position and **their own** dimension.
+    origin: [i32; 3],
+    origin_dim: String,
     waited: u32,
+}
+
+/// What one preparation step of an unbuilt room must do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// The room is built and its site is final: the player may be moved.
+    Ready,
+    /// Its shell's chunks are not loaded (or a write failed): try again next tick.
+    Wait,
+    /// Its site is taken: move the room to the next free one, then try again.
+    Relocate,
+    /// Its site is loaded and free: write the shell.
+    Build,
+    /// The room no longer exists (or no site is left): drop the entry.
+    Gone,
+}
+
+/// What preparation must do, from the room's state and its site. The one rule the entry path
+/// must keep: an unbuilt room is never `Ready`, so nothing is ever moved into a site the next
+/// pass may abandon.
+fn step(built: bool, loaded: bool, blocked: bool) -> Step {
+    if built {
+        return Step::Ready;
+    }
+    if !loaded {
+        return Step::Wait;
+    }
+    if blocked { Step::Relocate } else { Step::Build }
+}
+
+/// Whether a waiting entry has waited too long.
+fn entry_expired(waited: u32) -> bool {
+    waited >= ENTRY_WAIT_TICKS
+}
+
+/// Queue an entry, or replace the same player's own. A full queue refuses the newest player
+/// rather than growing without a bound.
+fn admit(pending: &mut Vec<PendingEntry>, entry: PendingEntry) -> bool {
+    if let Some(own) = pending
+        .iter_mut()
+        .find(|waiting| waiting.player == entry.player)
+    {
+        *own = entry;
+        return true;
+    }
+    if pending.len() >= MAX_PENDING_ENTRIES {
+        return false;
+    }
+    pending.push(entry);
+    true
 }
 
 struct Core {
@@ -167,8 +229,8 @@ struct Core {
     rng: Rng,
     /// Teleports to run at the next tick's end.
     teleports: Vec<Teleport>,
-    /// Shells to place after their player's teleport has loaded the chunks.
-    builds: Vec<PendingBuild>,
+    /// Entries waiting for their room to be validated and built.
+    entries: Vec<PendingEntry>,
     /// The binding of a machine that just broke, for its item's drop.
     broken: HashMap<(String, [i32; 3]), Binding>,
     /// When each player's PSD becomes usable again, in ticks.
@@ -188,7 +250,7 @@ impl Default for Core {
             store: Store::new(),
             rng: Rng::new(seed),
             teleports: Vec::new(),
-            builds: Vec::new(),
+            entries: Vec::new(),
             broken: HashMap::new(),
             cooldown: HashMap::new(),
             dirty: false,
@@ -269,7 +331,7 @@ fn ensure_world(host: &mut dyn ServerHost) {
     }
     state.store = load_store(&dir);
     state.teleports.clear();
-    state.builds.clear();
+    state.entries.clear();
     state.broken.clear();
     state.cooldown.clear();
     state.dirty = false;
@@ -292,7 +354,7 @@ fn close_world(save: bool) {
         state.world = None;
         state.store = Store::new();
         state.teleports.clear();
-        state.builds.clear();
+        state.entries.clear();
         state.broken.clear();
         state.cooldown.clear();
         state.dirty = false;
@@ -377,6 +439,10 @@ pub fn declare(r: &mut dyn Registrar) {
     let _ = MACHINE_KEY.set(machine);
     let _ = NEW_MACHINE_KEY.set(new_machine);
     let _ = SOLID_WALL_KEY.set(wall);
+    // A room's chunks are held by this package's own ticket while the room is being built (the
+    // player is not the one loading them any more). `validates` asks for `validate_tickets`,
+    // which drops tickets a previous run left behind: an entry never survives a restart.
+    let _ = TICKETS.set(r.register_ticket_controller("rooms", true));
 
     // `block_entity` + `block_entity_ticks` (API 15) are one declaration now: the type, the
     // blocks that hold it, and the Part attached to it.
@@ -530,7 +596,6 @@ fn leave_room(host: &mut dyn ServerHost, uuid: u128) -> Option<InteractionResult
                 player: uuid,
                 dim: left.dim,
                 pos: left.pos,
-                build: None,
             });
         }
     }
@@ -632,44 +697,12 @@ fn machine_click(host: &mut dyn ServerHost, click: &BlockClick<'_>) -> Option<In
             code
         }
     };
-    let room = {
-        let guard = core();
-        guard
-            .as_ref()
-            .and_then(|state| state.store.room(&code).cloned())
-    }?;
-    let entered = {
-        let mut guard = core();
-        let state = guard.as_mut()?;
-        state
-            .store
-            .enter(click.player, &code, player_pos, &room.dim, MAX_ENTRY_DEPTH)
-    };
-    match entered {
-        Enter::Entered { spawn } => {
-            let build = (!room.built).then(|| code.clone());
-            {
-                let mut guard = core();
-                if let Some(state) = guard.as_mut() {
-                    state.teleports.push(Teleport {
-                        player: click.player,
-                        dim: room.dim.clone(),
-                        pos: spawn,
-                        build,
-                    });
-                }
-            }
-            let _ = player.action_bar(
-                host,
-                tr("machine.compactmachines.machine.bound_to", &[&code]),
-            );
-            start_cooldown(click.player);
-        }
-        Enter::TooDeep => {
-            let _ = player.action_bar(host, tr("compactmachines.errors.too_far_down", &[]));
-        }
-        Enter::NoSuchRoom => {}
-    }
+    // The click is in the block's level; the player's own level is what their return point
+    // means (reach keeps them in the same level here, but the player is the authority).
+    let origin_dim = player
+        .dimension(&*host)
+        .map_or_else(|| dimension.clone(), |id| id.to_string());
+    begin_entry(host, click.player, &code, player_pos, &origin_dim);
     Some(InteractionResult::Success)
 }
 
@@ -831,8 +864,23 @@ pub fn server_stopping(_host: &mut dyn ServerHost) {
     close_world(true);
 }
 
-/// End of a running tick: run the queued teleports, then place the shells their arrival loaded,
-/// and write the store at most once a second.
+/// A level loaded the saved chunk tickets of this package's controller. An entry is never
+/// persisted, so every ticket found here is from a run that ended before it finished: remove
+/// them, so a restart never keeps a room's chunks (or their entities) loaded.
+pub fn validate_tickets(_host: &mut dyn ServerHost, event: &mut ValidateTicketsEvent<'_>) {
+    let blocks: Vec<[i32; 3]> = event
+        .validation
+        .block_tickets()
+        .into_iter()
+        .map(|(pos, _set)| pos)
+        .collect();
+    for pos in blocks {
+        event.validation.remove_block_tickets(pos);
+    }
+}
+
+/// End of a running tick: ready the rooms whose players are waiting, run the queued teleports
+/// (only ever into a built room), and write the store at most once a second.
 pub fn server_tick(host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
     let ServerTickPhase::ServerTickEnd { world_running } = event.phase else {
         return;
@@ -841,7 +889,7 @@ pub fn server_tick(host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
         return;
     }
     ensure_world(host);
-    let (teleports, builds, save) = {
+    let (entries, save) = {
         let mut guard = core();
         let Some(state) = guard.as_mut() else {
             return;
@@ -849,13 +897,56 @@ pub fn server_tick(host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
         state.ticks += 1;
         let save =
             state.dirty && state.ticks.saturating_sub(state.last_save) >= SAVE_INTERVAL_TICKS;
-        (
-            std::mem::take(&mut state.teleports),
-            std::mem::take(&mut state.builds),
-            save,
-        )
+        (std::mem::take(&mut state.entries), save)
     };
-    let mut later = Vec::new();
+    // Ready each waiting room before its player moves: the site is validated and the shell is
+    // written while the player is still at their origin, so the destination cannot change under
+    // them afterwards.
+    let mut waiting = Vec::new();
+    for mut entry in entries {
+        match prepare_room(host, &entry.code) {
+            Step::Ready => finish_entry(
+                host,
+                entry.player,
+                &entry.code,
+                entry.origin,
+                &entry.origin_dim,
+            ),
+            Step::Gone => notify(
+                host,
+                entry.player,
+                tr(
+                    "rooms.errors.compactmachines.room_not_found",
+                    &[&entry.code],
+                ),
+            ),
+            _ if entry_expired(entry.waited) => {
+                release_room(host, &entry.code);
+                notify(
+                    host,
+                    entry.player,
+                    Text::literal("The room could not be prepared; nothing was changed"),
+                );
+            }
+            _ => {
+                entry.waited += 1;
+                waiting.push(entry);
+            }
+        }
+    }
+    let teleports = {
+        let mut guard = core();
+        match guard.as_mut() {
+            Some(state) => {
+                state.entries = waiting;
+                if save {
+                    state.last_save = state.ticks;
+                }
+                std::mem::take(&mut state.teleports)
+            }
+            None => return,
+        }
+    };
     for teleport in teleports {
         if !teleport_player(host, &teleport) {
             // The player left between the click and the tick: drop the entry from their history
@@ -863,80 +954,6 @@ pub fn server_tick(host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
             let mut guard = core();
             if let Some(state) = guard.as_mut() {
                 let _ = state.store.leave(teleport.player);
-            }
-            continue;
-        }
-        if let Some(code) = teleport.build {
-            later.push(PendingBuild { code, waited: 0 });
-        }
-    }
-    for mut build in builds {
-        build.waited += 1;
-        let Some((room_box, room_dim)) = room_site(&build.code) else {
-            continue;
-        };
-        let mut done = true;
-        if !room_built(&build.code) {
-            let Some(level) = host.level(&room_dim) else {
-                // The level is not open yet: try again next tick (a room's level is the
-                // machine's, so it exists as soon as the world is up).
-                if build.waited < BUILD_RETRY_TICKS {
-                    later.push(build);
-                }
-                continue;
-            };
-            // A room is built by writing this shell into the level's reserved range, so the site
-            // must be empty first: writing over a player's build would destroy it, and a
-            // non-empty interior would enclose the player the machine teleports in. A site that
-            // is not free is abandoned and the room moves to the next one; the shell left by an
-            // earlier room of this port is fine to write over, but anything inside the interior
-            // is not.
-            if blocked_site(&*host, level, &room_box).is_some() {
-                let moved = {
-                    let mut guard = core();
-                    guard
-                        .as_mut()
-                        .is_some_and(|state| state.store.relocate(&build.code).is_some())
-                };
-                if moved && build.waited < SITE_TRIES {
-                    later.push(build);
-                }
-                continue;
-            }
-            let Some(wall) = SOLID_WALL_KEY.get().copied() else {
-                continue;
-            };
-            let Some(wall_state) = host.block_state_default(wall) else {
-                continue;
-            };
-            for pos in room_box.shell_blocks() {
-                if block_at(&*host, level, pos) == Some(wall) {
-                    continue;
-                }
-                if !matches!(
-                    level.set_block(host, pos, wall_state, shell_flags()),
-                    Ok(true)
-                ) {
-                    done = false;
-                }
-            }
-        }
-        if done {
-            let mut guard = core();
-            if let Some(state) = guard.as_mut() {
-                state.store.set_built(&build.code, true);
-                state.dirty = true;
-            }
-        } else if build.waited < BUILD_RETRY_TICKS {
-            later.push(build);
-        }
-    }
-    {
-        let mut guard = core();
-        if let Some(state) = guard.as_mut() {
-            state.builds = later;
-            if save {
-                state.last_save = state.ticks;
             }
         }
     }
@@ -948,6 +965,13 @@ pub fn server_tick(host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
         if let Some(world) = world {
             save_store(&world);
         }
+    }
+}
+
+/// One line to a player's action bar, silently dropped when they are gone.
+fn notify(host: &mut dyn ServerHost, player: u128, line: Text) {
+    if let Some(target) = host.player(player) {
+        let _ = target.action_bar(host, line);
     }
 }
 
@@ -967,20 +991,247 @@ fn teleport_player(host: &mut dyn ServerHost, teleport: &Teleport) -> bool {
         .teleport_to_level(host, &teleport.dim, pos, None)
 }
 
-/// A room's geometry and the level it stands in.
-fn room_site(code: &str) -> Option<(RoomBox, String)> {
+/// A room's geometry, the level it stands in, and whether its shell exists.
+fn room_state(code: &str) -> Option<(RoomBox, String, bool)> {
     let guard = core();
     let state = guard.as_ref()?;
     let room = state.store.room(code)?;
-    Some((state.store.room_box(code)?, room.dim.clone()))
+    Some((state.store.room_box(code)?, room.dim.clone(), room.built))
 }
 
-fn room_built(code: &str) -> bool {
-    let guard = core();
-    guard
-        .as_ref()
-        .and_then(|state| state.store.room(code))
-        .is_none_or(|room| room.built)
+// ---------------------------------------------------------------------------
+// Entry: ready the room, then move the player
+// ---------------------------------------------------------------------------
+
+/// Record the entry and queue the teleport. The history holds the player's **own** dimension
+/// and position: the room's level is where they arrive, never where they come back to (a bound
+/// machine carried to another dimension must not send them to its origin's coordinates in the
+/// room's world).
+fn record_entry(
+    store: &mut Store,
+    player: u128,
+    code: &str,
+    origin: [i32; 3],
+    origin_dim: &str,
+    max_depth: usize,
+) -> Enter {
+    store.enter(player, code, origin, origin_dim, max_depth)
+}
+
+/// Ask for an entry into `code`. The player is moved only once the room's site is validated and
+/// its shell is built; until then the entry waits in the tick's queue.
+fn begin_entry(
+    host: &mut dyn ServerHost,
+    player: u128,
+    code: &str,
+    origin: [i32; 3],
+    origin_dim: &str,
+) {
+    start_cooldown(player);
+    if prepare_room(host, code) == Step::Ready {
+        finish_entry(host, player, code, origin, origin_dim);
+        return;
+    }
+    let mut guard = core();
+    let Some(state) = guard.as_mut() else {
+        return;
+    };
+    admit(
+        &mut state.entries,
+        PendingEntry {
+            player,
+            code: code.to_owned(),
+            origin,
+            origin_dim: origin_dim.to_owned(),
+            waited: 0,
+        },
+    );
+}
+
+/// One preparation step for a room: hold its shell's chunks, and once they are loaded validate
+/// its site (relocating while it is taken) and write the shell.
+///
+/// The old order teleported first and built from the arrival: a site the build pass then found
+/// occupied was abandoned, which left the player at a destination that no longer belonged to a
+/// room (and the PSD then refused to take them back). Now the site is decided before the move.
+fn prepare_room(host: &mut dyn ServerHost, code: &str) -> Step {
+    let Some((room_box, room_dim, built)) = room_state(code) else {
+        return Step::Gone;
+    };
+    if built {
+        return Step::Ready;
+    }
+    let Some(level) = host.level(&room_dim) else {
+        return Step::Wait;
+    };
+    // Holding the chunks is what makes the site readable: a chunk nobody visited reads as no
+    // block, which would hide the terrain (or a player's build) that makes the site unusable.
+    hold_room(host, level, &room_box, true);
+    let loaded = room_loaded(&*host, level, &room_box);
+    let blocked = loaded && blocked_site(&*host, level, &room_box).is_some();
+    match step(built, loaded, blocked) {
+        Step::Relocate => {
+            // Nothing is written and nobody is moved: the room takes the next free site and the
+            // next tick judges that one.
+            hold_room(host, level, &room_box, false);
+            let moved = {
+                let mut guard = core();
+                guard
+                    .as_mut()
+                    .is_some_and(|state| state.store.relocate(code).is_some())
+            };
+            if moved { Step::Wait } else { Step::Gone }
+        }
+        Step::Build => {
+            if build_shell(host, level, &room_box) {
+                {
+                    let mut guard = core();
+                    if let Some(state) = guard.as_mut() {
+                        state.store.set_built(code, true);
+                        state.dirty = true;
+                    }
+                }
+                hold_room(host, level, &room_box, false);
+                Step::Ready
+            } else {
+                Step::Wait
+            }
+        }
+        ready => ready,
+    }
+}
+
+/// Finish an entry: record the player's own return point, then queue the teleport into the
+/// room's level.
+fn finish_entry(
+    host: &mut dyn ServerHost,
+    player: u128,
+    code: &str,
+    origin: [i32; 3],
+    origin_dim: &str,
+) {
+    let (entered, room_dim) = {
+        let mut guard = core();
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        let entered = record_entry(
+            &mut state.store,
+            player,
+            code,
+            origin,
+            origin_dim,
+            MAX_ENTRY_DEPTH,
+        );
+        let room_dim = state.store.room(code).map(|room| room.dim.clone());
+        (entered, room_dim)
+    };
+    match entered {
+        Enter::Entered { spawn } => {
+            let Some(room_dim) = room_dim else {
+                return;
+            };
+            {
+                let mut guard = core();
+                if let Some(state) = guard.as_mut() {
+                    state.teleports.push(Teleport {
+                        player,
+                        dim: room_dim,
+                        pos: spawn,
+                    });
+                }
+            }
+            if let Some(target) = host.player(player) {
+                let _ = target.action_bar(
+                    host,
+                    tr("machine.compactmachines.machine.bound_to", &[code]),
+                );
+            }
+            start_cooldown(player);
+        }
+        Enter::TooDeep => {
+            if let Some(target) = host.player(player) {
+                let _ = target.action_bar(host, tr("compactmachines.errors.too_far_down", &[]));
+            }
+        }
+        Enter::NoSuchRoom => {}
+    }
+}
+
+/// The chunks a room's shell touches (its interior inflated by one block).
+fn room_chunks(room_box: &RoomBox) -> Vec<[i32; 2]> {
+    let min_x = room_box.min[0] - 1;
+    let max_x = room_box.min[0] + room_box.dims[0] as i32;
+    let min_z = room_box.min[2] - 1;
+    let max_z = room_box.min[2] + room_box.dims[2] as i32;
+    let mut chunks = Vec::new();
+    for x in (min_x >> 4)..=(max_x >> 4) {
+        for z in (min_z >> 4)..=(max_z >> 4) {
+            chunks.push([x, z]);
+        }
+    }
+    chunks
+}
+
+/// Hold (or release) this package's own chunk ticket on every chunk of a room's shell, owned by
+/// the room's spawn block. A hold does not wait for generation: the room is built once the
+/// chunks report loaded, which is what the next preparation step asks.
+fn hold_room(host: &mut dyn ServerHost, level: LevelRef, room_box: &RoomBox, forced: bool) {
+    let Some(controller) = TICKETS.get().copied() else {
+        return;
+    };
+    let owner = TicketOwner::Block(room_box.spawn());
+    for at in room_chunks(room_box) {
+        let Some(chunk) = level.chunk_ref(&*host, at) else {
+            continue;
+        };
+        // `false` from the call means "the tickets did not change" (already held or already
+        // released), not a refusal.
+        let _ = chunk.set_mod_forced(host, controller, owner, forced, false);
+    }
+}
+
+/// Whether every chunk of a room's shell is loaded, so its blocks can be read and written.
+fn room_loaded(host: &dyn Host, level: LevelRef, room_box: &RoomBox) -> bool {
+    room_chunks(room_box).into_iter().all(|at| {
+        level
+            .chunk_ref(host, at)
+            .is_some_and(|chunk| chunk.loaded(host))
+    })
+}
+
+/// Release the tickets of a room's current site (a give-up or a close).
+fn release_room(host: &mut dyn ServerHost, code: &str) {
+    let Some((room_box, room_dim, _)) = room_state(code) else {
+        return;
+    };
+    let Some(level) = host.level(&room_dim) else {
+        return;
+    };
+    hold_room(host, level, &room_box, false);
+}
+
+/// Write the room's one-block shell. A write that does not land waits for the next tick.
+fn build_shell(host: &mut dyn ServerHost, level: LevelRef, room_box: &RoomBox) -> bool {
+    let Some(wall) = SOLID_WALL_KEY.get().copied() else {
+        return false;
+    };
+    let Some(wall_state) = host.block_state_default(wall) else {
+        return false;
+    };
+    let mut done = true;
+    for pos in room_box.shell_blocks() {
+        if block_at(&*host, level, pos) == Some(wall) {
+            continue;
+        }
+        if !matches!(
+            level.set_block(host, pos, wall_state, shell_flags()),
+            Ok(true)
+        ) {
+            done = false;
+        }
+    }
+    done
 }
 
 /// The first block of a room's inflated box that is not free for it: anything that is not air
@@ -1147,21 +1398,20 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
             give(host, player, stack);
         }
         RoomCommand::Teleport { code } => {
-            let room = {
+            let exists = {
                 let guard = core();
                 guard
                     .as_ref()
-                    .and_then(|state| state.store.room(&code))
-                    .cloned()
+                    .is_some_and(|state| state.store.room(&code).is_some())
             };
-            let Some(room) = room else {
+            if !exists {
                 reply(
                     host,
                     player,
                     tr("rooms.errors.compactmachines.room_not_found", &[&code]),
                 );
                 return Flow::Cancel;
-            };
+            }
             let Some(player) = player else {
                 // A console cannot be put in a room.
                 reply(
@@ -1177,45 +1427,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
             let dimension = player
                 .dimension(&*host)
                 .map_or_else(String::new, |id| id.to_string());
-            let entered = {
-                let mut guard = core();
-                match guard.as_mut() {
-                    Some(state) => {
-                        state
-                            .store
-                            .enter(player.uuid(), &code, pos, &dimension, MAX_ENTRY_DEPTH)
-                    }
-                    None => return Flow::Cancel,
-                }
-            };
-            match entered {
-                Enter::Entered { spawn } => {
-                    let build = (!room.built).then(|| code.clone());
-                    let mut guard = core();
-                    if let Some(state) = guard.as_mut() {
-                        state.teleports.push(Teleport {
-                            player: player.uuid(),
-                            dim: room.dim.clone(),
-                            pos: spawn,
-                            build,
-                        });
-                    }
-                }
-                Enter::TooDeep => {
-                    reply(
-                        host,
-                        Some(player),
-                        tr("compactmachines.errors.too_far_down", &[]),
-                    );
-                }
-                Enter::NoSuchRoom => {
-                    reply(
-                        host,
-                        Some(player),
-                        tr("rooms.errors.compactmachines.room_not_found", &[&code]),
-                    );
-                }
-            }
+            begin_entry(host, player.uuid(), &code, pos, &dimension);
         }
         RoomCommand::Unknown => {}
     }
@@ -1317,9 +1529,9 @@ mod tests {
             vec![
                 ("compactmachines rooms", 0),
                 ("compactmachines info", 0),
-                ("compactmachines give new <template:word>", 2),
-                ("compactmachines give existing <code:word>", 2),
-                ("compactmachines teleport <code:word>", 2),
+                ("compactmachines give new <template:text>", 2),
+                ("compactmachines give existing <code:text>", 2),
+                ("compactmachines teleport <code:text>", 2),
             ]
         );
     }
@@ -1353,5 +1565,96 @@ mod tests {
                 template: Template::Tiny
             }
         );
+    }
+
+    /// The review finding: the entry used to teleport the player first, and a later pass could
+    /// move the room away from under them. An unbuilt room is never `Ready`, so no teleport is
+    /// ever queued for one; a taken site is relocated, never built over.
+    #[test]
+    fn an_unbuilt_room_is_never_ready_and_a_taken_site_moves() {
+        for loaded in [false, true] {
+            for blocked in [false, true] {
+                assert_ne!(
+                    step(false, loaded, blocked),
+                    Step::Ready,
+                    "an unbuilt room answered Ready (loaded={loaded}, blocked={blocked})"
+                );
+            }
+        }
+        assert_eq!(step(false, true, true), Step::Relocate);
+        assert_eq!(step(false, true, false), Step::Build);
+        assert_eq!(step(false, false, false), Step::Wait);
+        assert_eq!(step(false, false, true), Step::Wait);
+        assert_eq!(step(true, false, true), Step::Ready);
+        assert_eq!(step(true, true, false), Step::Ready);
+    }
+
+    /// A room is only built once every chunk of its shell is loaded, so the site is judged on
+    /// real blocks: an unloaded chunk reads as no block and would hide a taken site.
+    #[test]
+    fn the_shell_is_not_written_before_its_chunks_are_loaded() {
+        assert_eq!(step(false, false, false), Step::Wait);
+        assert_eq!(step(false, true, false), Step::Build);
+    }
+
+    /// The review finding: a machine-triggered entry recorded the room's dimension with the
+    /// player's origin coordinates, so an exit after the machine was carried to another
+    /// dimension sent the player to those coordinates in the wrong world. The entry records the
+    /// player's own dimension, which is the only world their coordinates mean anything in.
+    #[test]
+    fn an_entry_returns_to_the_players_own_dimension_not_the_rooms() {
+        let mut store = Store::new();
+        let mut rng = Rng::new(1);
+        let code = store
+            .create_room(
+                Template::Normal,
+                7,
+                [0, 100, 0],
+                "minecraft:overworld",
+                &mut rng,
+            )
+            .code
+            .clone();
+        // The bound machine was carried through a portal: the room stays in the Overworld,
+        // the click (and so the player) is in the Nether.
+        let entered = record_entry(
+            &mut store,
+            42,
+            &code,
+            [10, 70, -4],
+            "minecraft:the_nether",
+            MAX_ENTRY_DEPTH,
+        );
+        assert!(matches!(entered, Enter::Entered { .. }));
+        let left = store.leave(42).expect("the entry was recorded");
+        assert_eq!(left.dim, "minecraft:the_nether");
+        assert_eq!(left.pos, [10, 70, -4]);
+    }
+
+    /// A player spamming the device, or a machine clicked twice, gets one pending entry, not a
+    /// queue: the wait is per player and bounded.
+    #[test]
+    fn pending_entries_are_one_per_player_and_bounded() {
+        fn of(player: u128, code: &str) -> PendingEntry {
+            PendingEntry {
+                player,
+                code: code.to_owned(),
+                origin: [0, 100, 0],
+                origin_dim: "minecraft:overworld".to_owned(),
+                waited: 0,
+            }
+        }
+        let mut pending = Vec::new();
+        assert!(admit(&mut pending, of(1, "AAAA-AAAA-AAAA")));
+        assert!(admit(&mut pending, of(2, "BBBB-BBBB-BBBB")));
+        // The same player's new click replaces their own entry instead of growing the queue.
+        assert!(admit(&mut pending, of(1, "AAAA-AAAA-AAAA")));
+        assert_eq!(pending.len(), 2);
+        for player in 3..(2 + MAX_PENDING_ENTRIES as u128 + 8) {
+            admit(&mut pending, of(player, "CCCC-CCCC-CCCC"));
+        }
+        assert_eq!(pending.len(), MAX_PENDING_ENTRIES);
+        assert!(!entry_expired(0));
+        assert!(entry_expired(ENTRY_WAIT_TICKS));
     }
 }

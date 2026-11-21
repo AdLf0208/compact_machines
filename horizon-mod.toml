@@ -14,7 +14,7 @@
 # Local-only until the maintainer approves publishing (ARCHITECTURE.md §8).
 id = "compactmachines"
 name = "Compact Machines"
-version = "0.2.0"
+version = "0.2.2"
 description = """A port of Compact Machines for Horizon: a machine block that owns a compact room you
 can enter and leave with the Personal Shrinking Device. A placed machine takes its room template
 (the jar's eight sizes, 3x3x3 up to 45x45x45) or the room code it was broken from; the device
@@ -33,5 +33,5 @@ capabilities = ["registries"]
 
 [native]
 game = "26.3"
-horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+horizon = "0a875da91dbb0fdcb7ba8c42c11341aa229af51a"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

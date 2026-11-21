@@ -87,3 +87,17 @@ Evidence: `../_shared/evidence/compactmachines/sdk-*.log` (+ `sdk-uses.json`,
 `sdk-entries.txt`, `sdk-sha256.txt`, `sdk-runtime-sha256.txt`). No 0.2.0 in-game
 run exists: `horizon-launcher` is not installed here, so no game carrying the
 package can be built — recorded as the port's open gap in `notes.md`.
+
+## 26.3 dialect sweep (2026-11-21) — 0.2.2
+
+| Check | Command | Result |
+|---|---|---|
+| static dialect | `python3 ports/tools/check_261_dialect.py compactmachines.hmod` | exit 0; pre-fix package exit 1 (`../_shared/evidence/compactmachines/dialect-check-red.log`) |
+| tests | `cargo test --offline` | exit 0 (`dialect-test.log`) |
+| package | `cargo horizon-mod build` twice after `rm -f Cargo.lock` | `cmp`-identical, built against 0a875da |
+| registry check | `cargo horizon-mod check compactmachines.hmod` | **74,833 B**, SHA-256 `0ce22800355b08221d3f8203e737d4c09db0ce2e547fdad59d95f81b7a80c161`, exit 0 |
+| fits the pin | `cargo horizon-mod fits compactmachines.hmod --build 0a875da` | `0a875da  made for`, exit 0 |
+| the gate | `python3 ports/tools/verify-sdk-package.py compactmachines` | 1/1 |
+| in game | `tools/e2e-dialect.sh` | `PASS` + `EXIT:0`; `SELFTEST=1` `FAIL` + `EXIT:1`; `check-e2e-logs.py compactmachines --strict` exit 0 |
+
+Changed: 4 loot tables. Proof: wall crafts 8 and drops 1; pre-fix red. Full record in [`notes.md`](notes.md) §"26.3 dialect sweep".

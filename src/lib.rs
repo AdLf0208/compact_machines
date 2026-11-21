@@ -30,6 +30,7 @@
 //! | `loot_drops` (75) | [`Mod::loot_drops`] |
 //! | `world_lifecycle` (v1) | [`Mod::world_lifecycle`] (close only: the registry loads lazily) |
 //! | `server_tick` (4) | [`Mod::server_tick`] |
+//! | `validate_tickets` (new) | [`Mod::validate_tickets`]: drop chunk tickets a crashed entry left |
 //! | `server_stopping` (44) | [`Mod::server_stopping`] |
 //! | `register_commands` (8) | [`Mod::register_commands`] |
 //! | `perform_command` (8) | [`Mod::run_mod_command`] (typed arguments) |
@@ -39,7 +40,8 @@ pub mod support;
 
 use mod_api::{
     self, ComponentTypesEvent, Flow, Hooks, RegisterCommandsEvent, Registrar, RegistrationContext,
-    RunModCommandEvent, ServerHost, ServerStoppingEvent, ServerTickEvent, WorldLifecycleEvent,
+    RunModCommandEvent, ServerHost, ServerStoppingEvent, ServerTickEvent, ValidateTicketsEvent,
+    WorldLifecycleEvent,
 };
 
 /// The mod keeps its state in [`support`]'s `Mutex<Option<Core>>`, not in this struct: one store
@@ -103,10 +105,16 @@ impl Hooks for Mod {
         support::world_lifecycle(host, event);
     }
 
-    /// End of a running tick: the deferred teleports, the shells their arrival loaded, and the
-    /// debounced registry write.
+    /// End of a running tick: ready the rooms whose players wait, the deferred teleports, and
+    /// the debounced registry write.
     fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
         support::server_tick(host, event);
+    }
+
+    /// A level loaded this package's saved chunk tickets: an entry never survives a restart, so
+    /// every one of them is stale and is dropped.
+    fn validate_tickets(&self, host: &mut dyn ServerHost, event: &mut ValidateTicketsEvent<'_>) {
+        support::validate_tickets(host, event);
     }
 
     /// The server is stopping: flush the registry.

@@ -5,7 +5,7 @@
 #
 # Cargo's name and version are not the mod's identity: horizon-mod.toml is.
 name = "compactmachines"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2024"
 license = "MIT"
 description = "Compact Machines for Horizon: a machine that owns a room you can enter and leave"

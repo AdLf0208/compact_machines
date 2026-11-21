@@ -1,0 +1,14 @@
+{
+  "recipe": {
+    "file": "data/compactmachines/recipe/wall.json",
+    "expect": {
+      "id": "compactmachines:wall",
+      "count": 8
+    },
+    "consume": "minecraft:polished_deepslate"
+  },
+  "loot": {
+    "block": "compactmachines:wall",
+    "expect": "compactmachines:wall"
+  }
+}

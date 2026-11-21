@@ -2,10 +2,10 @@
   "type": "minecraft:crafting_shaped",
   "category": "misc",
   "key": {
-    "E": { "item": "compactmachines:enlarging_module" },
-    "P": { "tag": "c:ingots/gold" },
-    "S": { "item": "compactmachines:shrinking_module" },
-    "W": { "item": "compactmachines:wall" }
+    "E": "compactmachines:enlarging_module",
+    "P": "#c:ingots/gold",
+    "S": "compactmachines:shrinking_module",
+    "W": "compactmachines:wall"
   },
   "pattern": ["WWW", "EPS", "WWW"],
   "result": {

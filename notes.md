@@ -17,10 +17,11 @@ with them ([LICENSE](LICENSE)).
 
 Status: **slice 1 implemented and verified in-game** — the machine block, its
 room (with the jar's own sizes), the Personal Shrinking Device's enter/leave,
-the world registry and the commands. **0.2.0 is the flat SDK package** (the
-`.hnmod` container was retired on 2026-11-18); its rules are unchanged and its
-ladder is green, but **no 0.2.0 in-game run exists** — `horizon-launcher` is not
-installed here. See "Migration to the SDK format" at the end of this file.
+the world registry and the commands. **0.2.1 is the current flat SDK package**
+(0.2.0 fixed by the PR #1234 review; see **"Review fixes (2026-11-18) — 0.2.1"**
+at the end of this file, which includes the port's **first in-game run**:
+`PASS` + `E2E EXIT:0`). The `.hnmod` container was retired on 2026-11-18; see
+"Migration to the SDK format" for that file map.
 
 ## Class + tier and approach
 
@@ -497,3 +498,143 @@ the reference migrations (`imfast`, `naturesaura`, `enderstorage`,
 `repeatable_trial_vaults`, `framedblocks`, `laserio`, `charginggadgets`), and the
 SDK's own `api-source/` (the generated `Hooks`/`Part` traits and the host area
 traits) rather than guessing a signature.
+
+## Review fixes (2026-11-18) — 0.2.1
+
+The registry source review of PR **#1234** (`var/review/1234-compactmachines.md`) left two findings
+on `src/support.rs`; both are fixed. The port's **first in-game run** — 0.2.0 never had one, so the
+ladder below is new — also found and fixed three defects that reading could not see. A fixed package
+is a new release: **0.2.1**, **74,888 B**, sha256
+`3088104a0e02b3a8887cf09b8b7743d8b522fdbf12c554794097c4fa9cb7cc09` (the entry's `file`/`sha256`
+change with it; the reviewer's missing `icons/<id>.png` item belongs to the registry entry, not the
+package, and is the orchestrator's).
+
+### The reviewer's findings
+
+1. **"`src/support.rs:859`: First entry teleports the player before validating or building the room.
+   The next build pass can discover an occupied site and relocate the room (line 894), leaving the
+   player at the original destination, potentially inside terrain. The PSD exit at line 516 requires
+   the player's current coordinates to still belong to a room, so it can refuse the return trip
+   after relocation."**
+   **Fix — the room is readied before the player moves.** `begin_entry` calls `prepare_room`, which:
+   holds the room's shell chunks with this package's own ticket (`Registrar::register_ticket_controller`,
+   so the site is judged on *generated* blocks instead of "no block" for a chunk nobody visited);
+   waits until they report loaded; validates the whole box and **relocates while the site is taken**;
+   writes the one-block shell; and only then answers `Ready`, which is the only path that records the
+   entry and queues the teleport. A room that is not ready after `ENTRY_WAIT_TICKS` (200) releases its
+   chunks and tells the player — the player is never moved into an unvalidated room. The 0.2.0
+   build-after-arrival list (`PendingBuild`, `Teleport.build`, `SITE_TRIES`, `BUILD_RETRY_TICKS`) is
+   gone, so nothing can relocate a room under a player any more, and the exit's "inside a room" check
+   (unchanged) can no longer be reached from a moved room. Tickets an interrupted entry left in the
+   save are dropped at the next world load by `validate_tickets`.
+   **Tests (red first, then green; each proved load-bearing by a mutation):**
+   `an_unbuilt_room_is_never_ready_and_a_taken_site_moves` (making an unbuilt room `Ready` fails it),
+   `the_shell_is_not_written_before_its_chunks_are_loaded`,
+   `pending_entries_are_one_per_player_and_bounded` (removing the cap fails it).
+   **In game (fail-capable):** the e2e puts a stone in the first room's site (`30005,200,30005`) before
+   the first machine is ever used. The room relocates *before* the move, the player arrives in a
+   built 9×9×9 shell elsewhere (`31032`…), the stone is still there, and the PSD takes them back. On
+   0.2.0's order the arrival is on the occupied site and the next assertion ("no wall 4 blocks east
+   of the spawn", then the exit) fails.
+
+2. **"`src/support.rs:646`: Entry through a bound machine records the destination room's dimension
+   with the player's origin coordinates. If the bound block was moved across dimensions, the exit at
+   line 529 sends the player to those coordinates in the wrong dimension."**
+   **Fix:** `record_entry` writes the player's **own** dimension (`PlayerRef::dimension`, falling back
+   to the clicked block's level) with their origin block. The room's level is where they arrive; it is
+   never the return point. Its signature has no room dimension to pass by mistake, and the call site no
+   longer has one in scope.
+   **Test:** `an_entry_returns_to_the_players_own_dimension_not_the_rooms` (the room is in the
+   Overworld, the click in the Nether → the history is the Nether; the 0.2.0 argument records the
+   Overworld and the test fails).
+   **In game:** the e2e gives a *bound* machine in the Nether (`/compactmachines give existing`), enters
+   the same Overworld room from there, and the exit returns the player to the Nether machine — on 0.2.0
+   the exit sends them to Overworld coordinates.
+
+### Port defects the in-game leg found (fixed in 0.2.1)
+
+None of these is upstream's; all three came from the 0.2.0 migration and none could be seen without a
+game, which is why the brief's in-game leg exists.
+
+1. **The carried recipes could never load.** Every ingredient was 1.21.1's `{"item": …}` / `{"tag": …}`
+   object; 26.3's recipe codec rejects it (`recipes: invalid ingredient (unresolved tag or malformed
+   input)`) and needs the plain string form (`"minecraft:ender_eye"`, `"#c:ingots/gold"`). All five
+   recipes were converted. **In game:** the e2e's `recipe give @s compactmachines:new_machine_normal`
+   answers `Unknown recipe` on 0.2.0 and `Unlocked 1 recipe(s)` on 0.2.1.
+2. **Three command usages could never parse their documented argument.** `word` is
+   `[0-9A-Za-z_]`, so `<template:word>` cannot carry `compactmachines:normal` and `<code:word>`
+   cannot carry a room code's `-`; the dispatcher refused every line with "Expected whitespace to end
+   one argument". The last argument of the three op commands is now a greedy `text`; the wordings are
+   unchanged (`compactmachines give new <template>`), and the usages test pins the new kinds.
+3. **The machine drop's component write path** is unchanged, but the in-game run confirmed the loot
+   path (the machine item with its room code) on a break — no defect found there.
+
+### Verification of 0.2.1 (all commands in a build-slot lease, `BUILD_LOCAL=1`, `CARGO_INCREMENTAL=0`)
+
+| Step | Command | Result |
+|---|---|---|
+| tests | `cargo test --offline` | **42 passed**, 0 failed (34 runtime + 8 glue) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, 0 warnings |
+| format | `cargo fmt --check` | clean |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **74,888 B**, sha256 `3088104a…7cc09`, byte-identical twice; 63 entries |
+| registry check | `cargo horizon-mod check compactmachines.hmod` | exit 0 |
+| fits | `cargo horizon-mod fits … --build nightly` | exit 0 |
+| `runtime.rs` untouched | `sha256sum src/runtime.rs` | `e6394dbd…23a4` — the 0.2.0 file, byte for byte |
+| in-game | `ports/tools/launcher-game.sh run compactmachines` | **PASS** + `E2E EXIT:0` (`_shared/evidence/compactmachines-e2e/e2e-launcher.log`) |
+| control | same e2e with `GAME=$CONTROL_GAME` | `FAIL: the carried machine recipe did not load` + `EXIT:1` (`e2e-control.log`) |
+| selftest | `SELFTEST=1` | `FAIL: no tiny wall …` + `EXIT:1` (`e2e-selftest.log`) |
+| log checker | `check-e2e-logs.py compactmachines-e2e --strict` | `logs=3 ok=3 missing-exit=0 bad-exit=0` |
+
+The e2e's own control leg (a game built without the package) still runs first and proves the ids and the
+recipe are the package's. `notes.md`'s earlier "no 0.2.0 in-game run exists" statement is superseded by
+these three logs.
+
+Skills: superpowers/using-superpowers,systematic-debugging,test-driven-development,verification-before-completion; BeautifulRust/rust-best-practices,rust-port
+
+Read at the boot step: `AGENTS.md`, `ARCHITECTURE.md` §0/§5/§8, `var/review/1234-compactmachines.md`,
+this file, `ports/_shared/launcher-e2e.md`, `ports/_shared/build-slots-usage.md`, and the SDK's
+generated `Hooks`/host area sources for `register_ticket_controller`, `chunk_ref`/`set_mod_forced`,
+`validate_tickets` and the command-argument kinds.
+
+## 26.3 dialect sweep (2026-11-21) — carried recipes and loot tables, proven in game (0.2.2)
+
+The shared checker `ports/tools/check_261_dialect.py` (generalised from `ports/modularrouters/tools/data_shape.py`
+and `ports/createaddition/tools/data_shape.py`) found the 1.21.1 forms still in the package that had shipped
+at **0.2.1**; `cargo horizon-mod check`, `fits` and every unit test had passed on them, and the content
+was dead in game (a recipe returns nothing; a block drops empty).
+
+| Family | Files | 1.21.1 form that shipped | 26.3 form |
+|---|---|---|---|
+| recipe ingredients | none changed (the port carried no 1.21.1 ingredient); `wall` — an already-correct recipe — is the craft proof | `{"item": "…"}` / `{"tag": "…"}` | `"minecraft:…"` / `"#c:…"` |
+| loot pools | 4 (`machine`, `new_machine`, `wall`, `solid_wall`): `"conditions"` array, `bonus_rolls`, `"rolls": 1.0` | `"conditions": [ … ]`, `bonus_rolls`, `"rolls": 1.0` | one `"condition": {"type": "minecraft:…"}`, no `bonus_rolls`, `"rolls": 1` |
+
+All four blocks are `requires_tool: true` and all four are already in `minecraft:mineable/pickaxe`, so the harvest-tag leg the sweep's checker also enforces is green.
+
+**Red, kept:** `ports/_shared/evidence/compactmachines/dialect-check-red.log` — the checker exits 1 on the pre-fix
+package itself (`dialect-prefix-0.2.1.hmod`, 0.2.1, kept in the same folder), naming every file.
+A reconstructed fixture carrying all three loot shapes plus a `requires_tool` block with no mineable tag is
+red too (`../../morered/dialect-check-fixture-red.log`). The checker's `--selftest` fails when any shape is
+accepted.
+
+  `recipe wall.json: crafting_shaped -> {"count": 8, "item": "compactmachines:wall", "slot": 200}`; `the result reached the inventory (8 compactmachines:wall), the grid emptied, and minecraft:polished_deepslate was consumed`
+
+  `the vanilla control dropped one, compactmachines:wall dropped 1 compactmachines:wall, and the cell is air`
+
+The in-game leg is `tools/e2e-dialect.sh` (`ports/_shared/evidence/compactmachines/e2e-dialect.log`): `PASS` + `EXIT:0`,
+and `SELFTEST=1` inverts the expectation and ends `FAIL` + `EXIT:1` (`e2e-dialect-selftest.log`).
+`check-e2e-logs.py compactmachines --strict` exits 0.
+
+**Ladder** (all in `build-slot.sh` leases, `CARGO_INCREMENTAL=0`, `BUILD_LOCAL=1`):
+
+| Step | Command | Result |
+|---|---|---|
+| tests | `cargo test --offline` | **42 passed**, 0 failed (`dialect-test.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` (twice) | built against **0a875da** (re-pinned from 0b14f8a), second build `cmp`-identical (`dialect-build-1.log`, `dialect-build-2.log`) |
+| registry check | `cargo horizon-mod check compactmachines.hmod` | `compactmachines 0.2.2 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, **74,833 B**, sha256 `0ce22800355b…` (`dialect-check.log`) |
+| fits the pin | `cargo horizon-mod fits compactmachines.hmod --build 0a875da` | `0a875da  made for`, exit 0 (`dialect-fits-0a875da.log`) |
+| fits the previous build | `… --build 0b14f8a` | `does not fit`, exit 1 (`dialect-fits-0b14f8a.log`) |
+| the gate | `python3 ports/tools/verify-sdk-package.py compactmachines` | **1/1** (`dialect-gate.log`) |
+
+Package 0.2.2: **74,833 B**, SHA-256 `0ce22800355b08221d3f8203e737d4c09db0ce2e547fdad59d95f81b7a80c161`.
+
+Skills: superpowers/using-superpowers,systematic-debugging,test-driven-development,verification-before-completion; BeautifulRust/none (no Rust change)

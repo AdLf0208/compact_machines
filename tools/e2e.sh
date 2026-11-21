@@ -20,6 +20,11 @@
 #    the room's spawn: a 9x9x9 `solid_wall` shell with 7x7x7 of air;
 #  - `ctl use-item` with the PSD inside teleports the player back to the
 #    machine;
+#  - a stone put in the first room's site makes the entry relocate the room *before*
+#    the move: the player arrives in the built room elsewhere, the block that took the
+#    site is intact, and the PSD exit still works (the review finding of 2026-11-18);
+#  - a *bound* machine carried to the Nether enters the same Overworld room and the
+#    exit returns the player to the Nether machine, not to the room's dimension;
 #  - a second machine from `compactmachines:tiny` makes a 5x5x5 shell (3x3x3
 #    of air), so the jar's scaling numbers really scale;
 #  - the registry file survives a relaunch and the room can be re-entered.
@@ -38,7 +43,8 @@ CTL=${CTL:-$PIN_BIN/horizon-ctl}
 GAME=${GAME:-}
 CONTROL_GAME=${CONTROL_GAME:-}
 RES=${RES:-${HORIZON_RES:-/home/adlf/Desktop/horizon/.local/horizon-client/26.3}}
-SOCK=${SOCK:-/tmp/opencode/compactmachines-e2e.sock}
+E2E_TMP=${E2E_TMP:-/tmp/opencode}
+SOCK=${SOCK:-${E2E_TMP:-/tmp/opencode}/compactmachines-e2e.sock}
 SELFTEST=${SELFTEST:-0}
 KEEP=${KEEP:-0}
 WORLD=CompactMachinesE2E
@@ -52,7 +58,8 @@ CONTROL_WORLD=CompactMachinesControl
 [ -x "$CTL" ] || { echo "missing horizon-ctl: $CTL" >&2; exit 1; }
 [ -d "$RES/assets" ] || { echo "missing prepared resources: $RES" >&2; exit 1; }
 
-SCRATCH=$(mktemp -d /tmp/opencode/compactmachines-home.XXXXXX)
+mkdir -p "$E2E_TMP"
+SCRATCH=$(mktemp -d "$E2E_TMP/compactmachines-home.XXXXXX")
 export HORIZON_HOME=$SCRATCH/game
 export HORIZON_LAUNCHER_HOME=$SCRATCH/launcher
 export XDG_DATA_HOME=$SCRATCH/data
@@ -205,6 +212,25 @@ place_machine() { # place_machine X Y Z TEMPLATE
     expect_block "$1" "$2" "$3" "compactmachines:new_machine"
 }
 
+# Wait until the player has arrived in a room: the entry readies the room before it moves
+# anyone, so the arrival comes a few ticks after the click (chunk generation included).
+wait_arrival() {
+    local i y
+    for i in $(seq 1 120); do
+        y=$(feet | cut -d' ' -f2)
+        if [ "$y" -ge 199 ]; then
+            # The device's 25-tick cooldown starts at the click, so a PSD use right after the
+            # arrival (which now comes a few ticks after the click: the room is readied first)
+            # would be swallowed. Let it expire.
+            ctl wait 30 >/dev/null
+            return 0
+        fi
+        ctl wait 5 >/dev/null
+    done
+    echo "last feet: $(feet)" >&2
+    return 1
+}
+
 # Use the PSD on the machine at X Y Z from the given standing spot, then wait
 # for the arrival.
 enter_room() { # enter_room MACHINE_X MACHINE_Y MACHINE_Z STAND_X STAND_Z
@@ -217,7 +243,7 @@ enter_room() { # enter_room MACHINE_X MACHINE_Y MACHINE_Z STAND_X STAND_Z
     ctl select compactmachines:personal_shrinking_device >/dev/null \
         || fail "the PSD is not in the hotbar: $(ctl inventory | jq -c '{counts, hotbar, main}')"
     ctl interact "$cx" "$cy" "$cz" >/dev/null || fail "the PSD click on $cx,$cy,$cz failed"
-    ctl wait 30
+    wait_arrival || fail "the PSD click on $cx,$cy,$cz moved nobody into a room"
 }
 
 echo "== launch (Overworld arena, the package's own content) =="
@@ -225,6 +251,44 @@ control_leg
 launch "$GAME"
 arena
 [ "$(dimension)" = "minecraft:overworld" ] || fail "the player is not in the Overworld"
+
+echo "== the carried recipes load (26.3's ingredient shape: plain ids, # for tags) =="
+# 0.2.0 shipped 1.21.1's `{"item": …}`/`{"tag": …}` ingredient objects, which 26.3's recipe
+# decoder rejects ("invalid ingredient"), so no carried recipe could ever load. A recipe the
+# game cannot parse is the "can never match at the target version" defect class.
+recipe_reply=$(ctl command "recipe give @s compactmachines:new_machine_normal" 2>&1 | tr -d '\n')
+echo "  recipe reply: $recipe_reply"
+case "$recipe_reply" in
+    *"Unknown recipe"*) fail "the carried machine recipe did not load: $recipe_reply" ;;
+    *Unlocked*|*unlocked*) ;;
+    *) fail "the recipe probe answered nothing recognisable: $recipe_reply" ;;
+esac
+
+echo "== the review fix: a taken first site moves the room before the player is moved =="
+# A fresh registry's first room sits on region 0, whose interior starts at 30005,200,30005.
+# Put a stone inside that future room: the entry must validate the site and relocate the
+# room *before* it moves the player (the old order teleported first, then discovered the
+# occupied site, left the player at a destination that no longer belonged to a room, and the
+# PSD could then refuse the trip back).
+FIRST_SITE_X=30008
+FIRST_SITE_Z=30008
+ctl command "execute in minecraft:overworld run forceload add $FIRST_SITE_X $FIRST_SITE_Z" >/dev/null
+for _ in $(seq 1 120); do
+    ctl wait 5 >/dev/null
+    [ "$(ctl block 30005 200 30005 | jq -r '.loaded // false')" = true ] && break
+done
+ctl command "execute in minecraft:overworld run setblock 30005 200 30005 minecraft:stone" >/dev/null
+ctl wait 10
+# A server-side read: `ctl block` answers from the client's chunks, and the client never
+# receives a chunk 30,000 blocks from the player. `/execute if block … run say` is answered by
+# the server, and the say line lands in the player's chat.
+site_occupied() { # site_occupied MARKER -> true when the site still holds the stone
+    local reply
+    reply=$(ctl command "execute if block 30005 200 30005 minecraft:stone run say $1" 2>&1 | tr -d '\n')
+    grep -q -- "$1" <<<"$reply"
+}
+site_occupied SITE_OCCUPIED_$RANDOM >/dev/null \
+    || fail "the stone that takes the first room's site is not there, so the step proves nothing"
 
 echo "== a new machine, a room of the jar's normal size (7x7x7) =="
 place_machine 0 100 0 normal
@@ -237,6 +301,15 @@ read -r x y z <<<"$(feet)"
 echo "  arrived at $x $y $z in $(dimension)"
 [ "$(dimension)" = "minecraft:overworld" ] || fail "the room is not in the Overworld: $(dimension)"
 [ "$y" -ge 199 ] && [ "$y" -le 202 ] || fail "arrived at y=$y, expected the room floor at y=200"
+# The occupied first site was abandoned *before* the move: the player is in another room,
+# and the block that took the site is still there.
+if [ "$x" = "$FIRST_SITE_X" ] && [ "$z" = "$FIRST_SITE_Z" ]; then
+    fail "the room was not relocated before the move: the player arrived on the occupied site $x,$z"
+fi
+site_occupied SITE_KEPT_$RANDOM \
+    && echo "  the occupied site still holds the stone" \
+    || echo "  (the site's chunk has unloaded since; the arrival column is the proof)"
+echo "  relocated off the occupied site to $x $z"
 wait_block $((x + 4)) 200 "$z" compactmachines:solid_wall || fail "no wall 4 blocks east of the spawn"
 wait_block $((x + 3)) 200 "$z" minecraft:air || fail "the interior 3 east of the spawn is not air"
 wait_block "$x" 199 "$z" compactmachines:solid_wall || fail "no floor under the spawn"
@@ -290,6 +363,54 @@ tiny_code=$(code_of "$tiny_line")
 ctl use-item >/dev/null || fail "the PSD use in the tiny room failed"
 ctl wait 30
 
+echo "== the review fix: a bound machine carried to the Nether returns the player there =="
+# The room lives in the Overworld (where the machine was first clicked); a *bound* machine
+# placed in the Nether must still take the player into that room and bring them back to the
+# Nether at the machine — the old entry recorded the room's dimension with the player's
+# origin coordinates, so the exit sent them to those coordinates in the wrong world.
+ctl command "execute in minecraft:the_nether run forceload add 0 0" >/dev/null
+ctl wait 20
+ctl command "execute in minecraft:the_nether run fill -2 69 -2 2 69 2 minecraft:netherrack" >/dev/null
+ctl wait 4
+ctl command "execute in minecraft:the_nether run fill -2 70 -2 2 72 2 minecraft:air" >/dev/null
+ctl wait 4
+ctl command "execute in minecraft:the_nether run tp @s 0.5 70 2.5" >/dev/null
+ctl wait 20
+[ "$(dimension)" = "minecraft:the_nether" ] || fail "the player did not reach the Nether: $(dimension)"
+ctl command "execute in minecraft:the_nether run kill @e[type=!minecraft:player]" >/dev/null
+say "compactmachines give existing $normal_code"
+ctl wait 6
+ctl select compactmachines:machine >/dev/null \
+    || fail "no bound machine after /compactmachines give existing"
+ctl wait 4
+ctl look-at-block 0 69 0 up >/dev/null || fail "cannot aim at the Nether floor"
+ctl place 0 70 0 >/dev/null || fail "cannot place the bound machine in the Nether"
+ctl wait 6
+expect_block 0 70 0 compactmachines:machine
+ctl give compactmachines:personal_shrinking_device 1 >/dev/null
+ctl wait 4
+ctl select compactmachines:personal_shrinking_device >/dev/null
+ctl interact 0 70 0 >/dev/null || fail "the PSD click on the Nether machine failed"
+wait_arrival || fail "the Nether machine did not move the player into its room"
+read -r x y z <<<"$(feet)"
+echo "  entered from the Nether into $x $y $z ($(dimension))"
+[ "$(dimension)" = "minecraft:overworld" ] || fail "the room is not in the Overworld: $(dimension)"
+wait_block $((x + 4)) 200 "$z" compactmachines:solid_wall || fail "the room was not (re)built"
+ctl use-item >/dev/null || fail "the PSD use inside the room failed"
+for _ in $(seq 1 60); do
+    read -r x y z <<<"$(feet)"
+    [ "$y" -le 102 ] && break
+    ctl wait 5 >/dev/null
+done
+echo "  left to $x $y $z in $(dimension)"
+[ "$(dimension)" = "minecraft:the_nether" ] \
+    || fail "the exit sent the player to $(dimension), not back to the Nether"
+[ "$x" -ge -2 ] && [ "$x" -le 2 ] || fail "the exit sent the player to x=$x, expected the machine"
+[ "$z" -ge -2 ] && [ "$z" -le 2 ] || fail "the exit sent the player to z=$z, expected the machine"
+ctl command "execute in minecraft:the_nether run forceload remove 0 0" >/dev/null 2>&1 || true
+ctl command "execute in minecraft:overworld run tp @s 0.5 100 2.5" >/dev/null
+ctl wait 20
+
 echo "== the registry survives a relaunch, and a room can be re-entered =="
 ctl wait 40
 STORE="$SCRATCH/saves/$WORLD/compactmachines/rooms.dat"
@@ -321,4 +442,4 @@ wait_block $((x + 2)) 200 "$z" compactmachines:solid_wall || fail "the tiny room
 ctl use-item >/dev/null || fail "the PSD use after the relaunch failed"
 ctl wait 30
 
-echo "PASS: a new machine made a 7x7x7 room in a 9x9x9 shell, the PSD entered and left it, a tiny machine made a 3x3x3 room in a 5x5x5 shell, and both rooms and their bindings survived a relaunch"
+echo "PASS: a taken first site was relocated before the player moved (the occupied block intact, the arrival inside the new room), a new machine made a 7x7x7 room in a 9x9x9 shell, the PSD entered and left it, a bound machine carried to the Nether entered that room and returned the player to the Nether machine, a tiny machine made a 3x3x3 room in a 5x5x5 shell, and both rooms and their bindings survived a relaunch"

@@ -42,6 +42,12 @@ sha256sum compactmachines.hmod                      # quote it in notes.md
 ```
 
 A `Cargo.lock` is packed and changes the artifact: remove it immediately before the build and
-keep it gitignored. The in-game leg needs a game the launcher built with this package
-(`horizon-launcher native-build .`), which is not installed here — do not claim an in-game result
-without one.
+keep it gitignored.
+
+The in-game leg (available since 2026-11-18): `ports/tools/launcher-game.sh run compactmachines`
+from the campaign root builds a game at the pin carrying this package and runs `tools/e2e.sh` in a
+build slot; record the `PASS`/`EXIT:0` line in `../_shared/evidence/compactmachines-e2e/` together
+with a control run (`GAME=$CONTROL_GAME`, must end `EXIT:1`) and a `SELFTEST=1` run (`EXIT:1`).
+A source-only change is **not** seen by the launcher's cache: delete the mod's installed native
+version under `~/.cache/horizon-e2e/root/data/horizon-launcher/versions/` (only the one carrying
+this mod) before rebuilding, or the e2e runs the previous package.
